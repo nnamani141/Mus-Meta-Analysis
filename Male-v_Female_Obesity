@@ -1,0 +1,258 @@
+##### Critical ###########
+# Don't clear the global environment between the male and female obesity runs, (I ran the male, and saves the Male_* objects, 
+# then the female, and saved the Female_* objects, and both sets coexist. 
+
+
+study_lookup <- c(
+  "limma_DEG_M_HFD_12w_vs_M_RD_12w"        = "GSE262523",
+  "limma_DEG_F_HFD_12w_vs_F_RD_12w"        = "GSE262523",   # same GSE, paired
+  "limma_DEG_Male_HFD_vs_Male_Chow"        = "GSE313717",
+  "limma_DEG_Female_HFD_vs_Female_Chow"    = "GSE313717",   # same GSE, paired
+  "limma_DEG_229697_HFD_vs_NCD"            = "GSE229697",
+  "limma_DEG_HFD_vs_SCD_20w"               = "GSE246221_20w",
+  "limma_DEG_HFD_vs_SCD_32w"               = "GSE246221_32w",
+  "limma_DEG_HFD_vs_chow"                  = "GSE273292",
+  "limma_DEG_HFD_12w_vs_Control"           = "GSE245301_12w",
+  "limma_DEG_296500_M_HFD_vs_M_Control"    = "GSE296500",
+  "limma_DEG_296500_F_HFD_vs_F_Control"    = "GSE296500",   # same GSE, paired
+  "limma_DEG_WT_HFD_vs_WT_NCD"             = "GSE188344",
+  "limma_DEG_ob_ob_ND_vs_WT_ND"            = "GSE167264_ob_ob",
+  "limma_DEG_M_129S1_HFD_vs_M_129S1_CD"    = "GSE182668_129S1/SvImJ",
+  "limma_DEG_F_129S1_HFD_vs_F_129S1_CD"    = "GSE182668_129S1/SvImJ", # same GSE, paired
+  "limma_DEG_M_C57BL6J_HFD_vs_M_C57BL6J_CD" = "GSE182668_C57BL/6J",
+  "limma_DEG_F_C57BL6J_HFD_vs_F_C57BL6J_CD" = "GSE182668_C57BL/6J", # same GSE, paired
+  "limma_DEG_121525_Male_HFD_vs_Male_LFD"      = "GSE121525",
+  "limma_DEG_121525_Female_HFD_vs_Female_LFD"  = "GSE121525", # same GSE, paired
+  "limma_DEG_327003_Male_HFD_vs_Male_LFD"      = "GSE327003",
+  "limma_DEG_327003_Female_HFD_vs_Female_LFD"  = "GSE327003", # same GSE, paired
+  "limma_DEG_335522_Male_HFD_vs_Male_NC"       = "GSE335522",
+  "limma_DEG_335522_Female_HFD_vs_Female_NC"   = "GSE335522", # same GSE, paired
+  "limma_DEG_120761_MWT_HFD_vs_MWT_ND"         = "GSE120761",
+  "limma_DEG_120761_FWT_HFD_vs_FWT_ND"         = "GSE120761"  # same GSE, paired
+)
+
+
+common <- intersect(rownames(Male_logFC), rownames(Female_logFC))
+
+fit_gene <- function(g) {
+  yi  <- c(as.numeric(Male_logFC[g, ]), as.numeric(Female_logFC[g, ]))
+  sei <- c(as.numeric(Male_SE[g, ]),    as.numeric(Female_SE[g, ]))
+  contr <- c(colnames(Male_logFC), colnames(Female_logFC))
+  sex <- c(rep(0.5, ncol(Male_logFC)), rep(-0.5, ncol(Female_logFC)))
+  study <- study_lookup[contr]
+  
+  ok <- is.finite(yi) & is.finite(sei) & sei > 0
+  if (sum(ok) < 4) return(c(intercept=NA, intercept_p=NA, sex_coef=NA, sex_p=NA, k=sum(ok)))
+  dat <- data.frame(yi=yi[ok], vi=sei[ok]^2, sex=sex[ok], study=study[ok])
+  both <- length(unique(dat$sex)) == 2
+  m <- tryCatch(
+    if (both) rma.mv(yi, vi, mods=~sex, random=~1|study, data=dat, method="REML")
+    else      rma.mv(yi, vi,           random=~1|study, data=dat, method="REML"),
+    error=function(e) NULL)
+  if (is.null(m)) return(c(intercept=NA, intercept_p=NA, sex_coef=NA, sex_p=NA, k=sum(ok)))
+  c(intercept=as.numeric(m$b[1]), intercept_p=m$pval[1],
+    sex_coef=if(both) as.numeric(m$b[2]) else NA,
+    sex_p=if(both) m$pval[2] else NA, k=sum(ok))
+}
+
+res <- t(vapply(common, fit_gene, numeric(5)))
+res <- as.data.frame(res)
+res$gene <- common
+res$intercept_FDR <- p.adjust(res$intercept_p, "BH")
+res$sex_FDR       <- p.adjust(res$sex_p, "BH")
+
+
+# needs mean per-sex logFC per gene
+male_mean   <- rowMeans(Male_logFC[common, ], na.rm = TRUE)
+female_mean <- rowMeans(Female_logFC[common, ], na.rm = TRUE)
+plot_df <- data.frame(gene = common, male = male_mean, female = female_mean,
+                      dimorphic = res$sex_FDR[match(common, res$gene)] < 0.05)
+str(plot_df)
+# Plots for the sex-covariate obesity meta-regression
+
+# ============================================================================
+library(dplyr); 
+library(ggplot2); 
+library(ggrepel); 
+library(EnhancedVolcano)
+library(metafor)
+
+# Mapping some genes
+lab_genes <- c("Gpnmb", "Cd36", "Lcn2", "Srgap3", "Ctse", "Gpr12", "Adgrf1", "Hsd3b5", "Cidea", "Slc13a2", "Serpine1")
+
+# 1. Sex-ADJUSTED obesity volcano (main signature): intercept vs its FDR OR obesity-responsive genes
+EnhancedVolcano(res,
+                lab = res$gene,
+                lab_genes,
+                x = "intercept", 
+                y = "intercept_FDR",
+                pCutoff = 0.05, 
+                FCcutoff = 1.0,
+                pointSize = 2.0, 
+                labSize = 6.0,
+                title = "Sex-adjusted obesity signature",
+                subtitle = "Meta-regression intercept (sex-averaged effect)",
+                legendPosition = 'top',
+                legendLabSize = 14,
+                legendIconSize = 3.0,
+                xlab = bquote(Sex-adjusted~pooled~Log[2]~"FC"),
+                ylab = bquote(-Log[10]~adjusted~italic(P)),
+                col = c("grey70","forestgreen","royalblue","red"), 
+                colAlpha = 0.8)
+
+# 2. SEX-DIFFERENCE volcano: which genes respond differently by sex
+#    (positive sex_coef = stronger in males, since male = +0.5). sex-dimorphic genes (regardless of net obesity effect)
+lab_genes <- c("Aldh1a1", "Cfd", "Cyp2b9", "Cyp2b13, Cyp26a1", "Cyp3a16", "Themis","Sult1e1", "Sult2a3", "Sult2a5", "Cspg5", 
+               "Ephx1", "Slco2a1", "Cidea", "Hsd3b5")
+
+sex_df <- res %>% filter(!is.na(sex_coef))
+EnhancedVolcano(sex_df,
+                lab = sex_df$gene,
+                lab_genes,
+                x = "sex_coef", 
+                y = "sex_FDR",
+                pCutoff = 0.05, 
+                FCcutoff = 0.5,
+                pointSize = 2.0, 
+                labSize = 5.5,
+                title = "Sex-by-obesity interaction",
+                subtitle = "Meta-regression sex coefficient (+ = male-biased)",
+                legendPosition = 'top',
+                legendLabSize = 14,
+                legendIconSize = 3.0,
+                xlab = bquote(Male~-~Female~difference~(Log[2]~"FC")),
+                ylab = bquote(-Log[10]~adjusted~italic(P)),
+                col = c("grey70","forestgreen","royalblue","red"), 
+                colAlpha = 0.8)
+
+
+Obsgene <- res$gene
+# 3. Male-vs-female concordance scatter (obesity-responsive genes, showing that most are sex-concordant, with the dimorphic subset marked)
+male_mean   <- rowMeans(Male_logFC[Obsgene, ,  drop=FALSE], na.rm = TRUE)
+female_mean <- rowMeans(Female_logFC[Obsgene, , drop=FALSE], na.rm = TRUE)
+MvF_k <- res$k
+MvF_FDR <- res$intercept_FDR
+
+scat <- data.frame(gene = Obsgene, male = male_mean, female = female_mean, k= MvF_k,
+                   FDR = MvF_FDR, dimorphic = res$sex_FDR < 0.05 & !is.na(res$sex_FDR))
+
+rho <- cor(scat$male, scat$female, use = "complete.obs", method = "spearman")
+
+## Male-vs-female concordance scatter (DEG only)
+deg_genes <- res$gene[res$intercept_FDR < 0.05 & abs(res$intercept) > 1]
+scat_deg <- scat[scat$gene %in% deg_genes, ]
+rho_deg <- cor(scat_deg$male, scat_deg$female, method = "spearman", use = "complete.obs")
+
+# Mapping out all the dimorphic genes
+lab_genes <- scat_deg %>% filter(dimorphic) %>%
+  mutate(d = abs(male - female)) %>% arrange(desc(d)) %>% head(57)
+
+ggplot(scat, aes(male, female)) +
+  geom_hline(yintercept = 0, linewidth = .3, colour = "grey60") +
+  geom_vline(xintercept = 0, linewidth = .3, colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+  geom_point(aes(colour = dimorphic), alpha = .5, size = 1.2) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = .5, colour = "black") +
+  ggrepel::geom_text_repel(data = lab_genes, aes(label = gene), size = 5, max.overlaps = Inf) +
+  scale_colour_manual(values = c("FALSE" = "grey70", "TRUE" = "firebrick"),
+                      labels = c("Concordant","Sex-dimorphic (FDR<0.05)"), name = NULL) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("Spearman rho = ", round(rho, 2))) +
+  labs(x = expression(Male~mean~Log[2]~"FC"),
+       y = expression(Female~mean~Log[2]~"FC"),
+       title = "Cross-sex concordance of the hepatic obesity response") +
+  theme_bw(base_size = 12)
+
+
+ggplot(scat_deg, aes(male, female)) +
+  geom_hline(yintercept = 0, linewidth = .3, colour = "grey60") +
+  geom_vline(xintercept = 0, linewidth = .3, colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+  geom_point(aes(colour = dimorphic), alpha = .5, size = 2.0) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = .5, colour = "black") +
+  ggrepel::geom_text_repel(data = lab_genes, aes(label = gene), size = 5, max.overlaps = Inf) +
+  scale_colour_manual(values = c("FALSE" = "grey70", "TRUE" = "firebrick"),
+                      labels = c("Concordant","Sex-dimorphic (FDR<0.05)"), name = NULL) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("Spearman rho = ", round(rho, 2))) +
+  labs(x = expression(Male~mean~Log[2]~"FC"),
+       y = expression(Female~mean~Log[2]~"FC"),
+       title = "Cross-sex concordance of the hepatic obesity response") +
+  theme_bw(base_size = 12)
+
+Responders <- res[res$gene %in% deg_genes, ]
+concordant <- res %>%
+  filter(intercept_FDR < 0.05, abs(intercept) > 1,     # obesity-responsive
+         sex_FDR >= 0.05 | is.na(sex_FDR)) %>%          # NOT sex-dimorphic = concordant
+  arrange(intercept_FDR)
+
+Discordant <- res %>%
+  filter(intercept_FDR < 0.05, abs(intercept) > 1,     
+         sex_FDR <= 0.05) %>%          
+  arrange(intercept_FDR)
+
+# Sex-dimorphic genes (significant sex coefficient) with or without obesity response
+dimorphic <- res %>%
+  filter(!is.na(sex_FDR),
+         sex_FDR < 0.05,
+         abs(sex_coef) > 0.5) %>%       # match the FCcutoff you used in the plot
+  arrange(sex_FDR) 
+
+
+# AUTOMATIC EXPORT TO EXCEL 
+wb <- createWorkbook()
+addWorksheet(wb, "Obesity_Sex_Responders")
+addWorksheet(wb, "Concordant_DEGs")
+addWorksheet(wb, "Sexual_Dimorphic_DEGs")
+addWorksheet(wb, "Sexual_Effects_DEGs")
+# Write the clean filtered core signature to the first tab
+writeData(wb, "Obesity_Sex_Responders", Responders, rowNames = FALSE)
+# Write the clean filtered core signature to the second tab
+writeData(wb, "Concordant_DEGs", concordant, rowNames = FALSE)
+# Write the clean filtered core signature to the third tab
+writeData(wb, "Sexual_Dimorphic_DEGs", Discordant, rowNames = FALSE)
+# Write the clean filtered core signature to the fourth tab
+writeData(wb, "Sexual_Effects_DEGs", dimorphic, rowNames = FALSE)
+# Save the workbook to your directory
+output_file <- file.path(dfp, "Concordant_MF_Meta_DEGs.xlsx")
+saveWorkbook(wb, output_file, overwrite = TRUE)
+
+cat(paste0("\nFile successfully exported to: ", output_file, "\n"))
+
+
+# ----------------------------------------------------------------------------
+# 4. Forest plots for top sex-dimorphic genes (male vs female arms)
+# ----------------------------------------------------------------------------
+top_dimorphic <- Discordant %>%                            # strongest obesity effect first
+  slice_head(n = 10) %>% pull(gene)
+
+forest_sex <- function(g) {
+  yi  <- c(as.numeric(Male_logFC[g, ]),  as.numeric(Female_logFC[g, ]))
+  sei <- c(as.numeric(Male_SE[g, ]),     as.numeric(Female_SE[g, ]))
+  sex <- c(rep("M", ncol(Male_logFC)), rep("F", ncol(Female_logFC)))
+  labs <- c(colnames(Male_logFC), colnames(Female_logFC))
+  contr <- c(colnames(Male_logFC), colnames(Female_logFC))
+  short <- paste0(study_lookup[contr], " (", sex, ")") # short label: GSE id from study_lookup + sex tag
+  
+  ok <- is.finite(yi) & is.finite(sei) & sei > 0
+  m <- rma(yi[ok], sei = sei[ok], method = "REML")
+  ord <- order(sex[ok])
+  forest(m, 
+         slab = short[ok][ord],
+         order = ord,                 # group males then females
+         col = ifelse(sex[ok] == "M","navy","darkred")[ord],
+         xlab = expression(Log[2]~"FC"), header = "Study (arm)",
+         main = paste0(g, "  (Sex-adjusted obesity FDR = ",
+                       format.pval(res$intercept_FDR[res$gene==g], 2), ")"),
+         cex = 0.7, pch = 15)
+}
+par(mfrow = c(1, 1)); for (g in top_dimorphic) forest_sex(g); par(mfrow = c(1,1))
+
+# ----------------------------------------------------------------------------
+# QC read
+# ----------------------------------------------------------------------------
+cat("Fits failed (NA intercept):", sum(is.na(res$intercept)), "\n")
+cat("Sex-estimable genes:",        sum(!is.na(res$sex_coef)), "\n")
+cat("Sex-adjusted obesity DEGs:",  sum(res$intercept_FDR < 0.05, na.rm=TRUE), "\n")
+cat("Sex-dimorphic genes:",        sum(res$sex_FDR < 0.05, na.rm=TRUE), "\n")
+
