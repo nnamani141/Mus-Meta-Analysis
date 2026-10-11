@@ -1,0 +1,862 @@
+# Load required packages
+library(dplyr)
+library(EnhancedVolcano)
+library(pheatmap)
+library(RColorBrewer)
+library(metafor)
+library(openxlsx)
+library(enrichplot)
+library(matrixStats)
+library(sparseMatrixStats)
+library(DelayedMatrixStats)
+library(clusterProfiler)
+library(org.Mm.eg.db) 
+library(ggridges)
+library(pheatmap)
+library(RColorBrewer)
+
+# Set file path
+fp <- "C:/Users/dnnamani/OneDrive - University of Tennessee/UTHSC/Personal_Ideas/"
+
+# get to the data folder
+dfp <- paste0(fp, "Diabetic_Liver_Data/Meta_analysis/") 
+
+# Set the meta analysis file path
+Metafp <- list.files(path = dfp, pattern = "\\.csv$", full.names = TRUE)
+
+# Create an empty list to store your studies
+all_studies <- list()
+
+# Loop through each file and load it automatically
+for (file in Metafp) {
+  
+  # Clean up the file path to get just the clean name (e.g., "meta319011")
+  study_name <- tools::file_path_sans_ext(basename(file))
+  
+  # Read the file and assign it to our list using that clean name
+  all_studies[[study_name]] <- read.csv(file, row.names = 1)
+}
+
+# Track 1: The "Pure Obesity signature" Meta-Analysis
+# The Biological Question: What is the universal, background-independent hepatic response to high-fat or western diets?
+# Comparisons 
+# Collect all available filtered gene names from the studies
+study_names <- c(
+  "limma_DEG_F_HFD_12w_vs_F_RD_12w",
+  "limma_DEG_Female_HFD_vs_Female_Chow",
+  "limma_DEG_296500_F_HFD_vs_F_Control",
+  "limma_DEG_F_129S1_HFD_vs_F_129S1_CD",
+  "limma_DEG_F_C57BL6J_HFD_vs_F_C57BL6J_CD",
+  "limma_DEG_121525_Female_HFD_vs_Female_LFD",
+  "limma_DEG_327003_Female_HFD_vs_Female_LFD",
+  "limma_DEG_335522_Female_HFD_vs_Female_NC",
+  "limma_DEG_120761_FWT_HFD_vs_FWT_ND"
+)
+
+# Pull studies directly from all_studies
+study_objects <- all_studies[study_names]
+
+# Verify all studies were found
+if (
+  length(study_objects) != length(study_names) ||
+  any(is.na(match(study_names, names(all_studies))))
+) {
+  stop("One or more specified studies were not found.")
+}
+
+cat("Number of comparisons:", length(study_objects), "\n")
+
+
+
+# Require a gene to be available in at least 50% of studies
+min_studies <- ceiling(length(study_objects) * 0.50)
+cat("Minimum number of studies required:", min_studies, "\n")
+
+# Count the number of studies in which each gene is present
+gene_study_counts <- table(
+  unlist(
+    lapply(
+      study_objects,
+      rownames
+    )
+  )
+)
+
+# Retain genes present in >= 50% of studies
+meta_Obs_genes <- names(
+  gene_study_counts[
+    gene_study_counts >= min_studies
+  ]
+)
+
+cat(
+  "Genes retained for meta-analysis:",
+  length(meta_Obs_genes),
+  "\n"
+)
+
+
+
+# Define total sample sizes (N) for each study in the exact order of the studies 1-9
+study_sample_sizes <- c(6, 10, 8, 6, 6, 11, 12, 8, 6) 
+
+if (length(study_sample_sizes) != length(study_objects)) {
+  stop("Number of sample sizes does not match number of studies.")
+}
+
+study_weights <- sqrt(study_sample_sizes)
+
+names(study_weights) <- study_names
+
+print(study_weights)
+
+# BUILD MASTER INPUT MATRIX
+meta_input_df <- data.frame(
+  gene = meta_Obs_genes,
+  stringsAsFactors = FALSE
+)
+
+rownames(meta_input_df) <- meta_Obs_genes
+
+for (i in seq_along(study_objects)) {
+  
+  df_tmp <- study_objects[[i]]
+  
+  # Check required columns
+  if (!all(c("logFC", "PValue", "SE") %in% colnames(df_tmp))) {
+    stop(
+      paste0(
+        "Study ",
+        study_names[i],
+        " is missing logFC, PValue, or SE."
+      )
+    )
+  }
+  
+  study_genes <- rownames(df_tmp)
+  
+  # Match genes
+  idx <- match(
+    meta_Obs_genes,
+    study_genes
+  )
+  
+  # Missing genes become NA
+  meta_input_df[[paste0("logFC_stud", i)]] <-
+    as.numeric(df_tmp$logFC[idx])
+  
+  meta_input_df[[paste0("PValue_stud", i)]] <-
+    as.numeric(df_tmp$PValue[idx])
+  
+  meta_input_df[[paste0("SE_stud", i)]] <-
+    as.numeric(df_tmp$SE[idx])
+}
+
+
+# DIRECTION-AWARE Z-SCORE
+compute_directional_z <- function(p, logFC) {
+  # Invalid values become NA
+  p[!is.finite(p)] <- NA
+  logFC[!is.finite(logFC)] <- NA
+  
+  p <- pmax(pmin(p, 0.999999), 1e-15) # Avoid infinite boundaries
+  z <- qnorm(p / 2, lower.tail = FALSE)
+  return(z * sign(logFC))
+}
+
+# GENERATE DIRECTIONAL Z-SCORES
+for (i in seq_along(study_objects)) {
+  
+  meta_input_df[[paste0("z_stud", i)]] <-
+    compute_directional_z(
+      meta_input_df[[paste0("PValue_stud", i)]],
+      meta_input_df[[paste0("logFC_stud", i)]]
+    )
+}
+
+# Execute the 9-Way Weighted Stouffer Math Row-by-Row
+# ==============================================================================
+run_stouffer <- function(z_scores, weights) {
+  
+  valid <- is.finite(z_scores) &
+    is.finite(weights)
+  
+  z_scores <- z_scores[valid]
+  weights  <- weights[valid]
+  
+  k <- length(z_scores)
+  
+  if (k == 0) {
+    return(
+      c(
+        k = 0,
+        meta_Z = NA,
+        meta_P = NA
+      )
+    )
+  }
+  
+  numerator <- sum(
+    z_scores * weights
+  )
+  
+  denominator <- sqrt(
+    sum(weights^2)
+  )
+  
+  meta_Z <- numerator / denominator
+  
+  meta_P <- 2 * pnorm(
+    abs(meta_Z),
+    lower.tail = FALSE
+  )
+  
+  c(
+    k = k,
+    meta_Z = meta_Z,
+    meta_P = meta_P
+  )
+}
+
+# Extract the column names of your directional Z-scores from the master matrix
+z_col_names <- paste0("z_stud", seq_along(study_objects))
+
+# Apply the function across all genes
+meta_stats <- t(apply(meta_input_df[, z_col_names], 1, run_stouffer, weights = study_weights))
+
+meta_stats <- as.data.frame(meta_stats)
+
+meta_stats$gene <- meta_input_df$gene
+
+# Bind the stats back and apply Benjamini-Hochberg FDR correction
+final_meta_analysis <- meta_input_df %>%
+  left_join(
+    meta_stats,
+    by = "gene"
+  )
+
+final_meta_analysis <- final_meta_analysis %>%
+  mutate(
+    meta_FDR = p.adjust(
+      meta_P,
+      method = "BH"
+    )
+  )
+
+# Define the logFC columns/ Add mean_log2FC
+logFC_cols <- paste0("logFC_stud", 1:9)
+
+# Calculate mean log2FC across available studies
+# na.rm = TRUE means missing studies are ignored
+final_meta_analysis <- final_meta_analysis %>%
+  mutate(
+    mean_log2FC = rowMeans(
+      dplyr::select(., all_of(logFC_cols)),
+      na.rm = TRUE
+    )
+  )
+
+# DIRECTION CONSISTENCY
+
+# DEFINE LOGFC AND SE COLUMNS
+
+logFC_cols <- paste0("logFC_stud", 1:9)
+SE_cols    <- paste0("SE_stud", 1:9)
+
+final_meta_analysis$Direction_Agreement <- NA_real_
+final_meta_analysis$Direction_Consistency <- NA_character_
+
+for (i in seq_len(nrow(final_meta_analysis))) {
+  
+  lfc <- as.numeric(
+    final_meta_analysis[i, logFC_cols]
+  )
+  
+  lfc <- lfc[is.finite(lfc) & lfc != 0]
+  
+  if (length(lfc) > 0 &&
+      is.finite(final_meta_analysis$meta_Z[i])) {
+    
+    meta_direction <- sign(
+      final_meta_analysis$meta_Z[i]
+    )
+    
+    final_meta_analysis$Direction_Agreement[i] <-
+      mean(
+        sign(lfc) == meta_direction
+      )
+    
+    final_meta_analysis$Direction_Consistency[i] <-
+      ifelse(
+        length(unique(sign(lfc))) == 1,
+        "Consistent",
+        "Inconsistent"
+      )
+  }
+}
+
+
+# Filter for statistically significant consensus genes (FDR < 0.05)
+significant_meta_DEGs <- final_meta_analysis %>% 
+  filter(meta_FDR < 0.05) %>%
+  filter(abs(mean_log2FC) > 1)
+
+# Count total, upregulated, and downregulated meta-DEGs
+total_sig_DEGs     <- nrow(significant_meta_DEGs)
+upregulated_count   <- significant_meta_DEGs %>% filter(meta_Z > 0) %>% nrow()
+downregulated_count <- significant_meta_DEGs %>% filter(meta_Z < 0) %>% nrow()
+
+# Print the dynamic summary text to your console
+cat("----------------------------------------------------------------------\n")
+cat(paste0("Using a weighted Stouffer approach, we identified ", total_sig_DEGs, 
+           " meta-analysis DEGs (adjusted p-value < 0.05), including ", upregulated_count, 
+           " genes with positive meta-analysis Z-scores and ", downregulated_count, 
+           " with negative meta-analysis Z-scores.\n"))
+cat("----------------------------------------------------------------------\n\n")
+
+
+# STEP 3: Identify Your Top Magnitude Biological Targets
+# Regulation status
+logFC_cols <- paste0("logFC_stud", 1:9)
+
+significant_meta_DEGs$Regulation <- case_when(
+  significant_meta_DEGs$meta_Z > 0 ~ "Upregulated",
+  significant_meta_DEGs$meta_Z < 0 ~ "Downregulated",
+  TRUE ~ "Neutral"
+)
+# Get direction agreement
+meta_direction <- sign(significant_meta_DEGs$meta_Z)
+
+# ==============================================================================
+# STEP 4: Identify Your Top Magnitude Biological Targets
+# ==============================================================================
+# Ensure gene symbols are accessible as a clean character column
+#final_meta_analysis$gene <- rownames(final_meta_analysis)
+
+# Mapping some genes
+lab_genes <- c("Wfdc2", "Cyp51", "Mmp12", "Cyp2b10", "Nsdhl", "Fabp5", "Adgrf1", "Hsd3b5", "Gpc1", "Sult2a5", "Lepr")
+
+EnhancedVolcano(
+  final_meta_analysis,
+  lab = final_meta_analysis$gene,
+  lab_genes,
+  x = 'mean_log2FC',               
+  y = 'meta_FDR',             # Multiple-testing corrected significance axis
+  pCutoff = 0.05,             # Standard FDR threshold line
+  FCcutoff = 1.0,             # Absolute Meta-Z threshold line
+  pointSize = 3.0,
+  labSize = 6.0,
+  title = 'Pure Obesity in females',
+  subtitle = 'Weighted Stouffer Consensus Integration (9 Comparisons)',
+  caption = paste0('Total genes = ', nrow(final_meta_analysis)),
+  legendPosition = 'top',
+  legendLabSize = 14,
+  legendIconSize = 3.0,
+  col = c('grey30', 'forestgreen', 'royalblue', 'red'),
+  colAlpha = 0.8,
+  xlab = bquote(Mean ~Log[2]~ "Fold Change"),
+  ylab = bquote(-Log[10]~adjusted~italic(P)))
+
+
+
+# 1. Select the top 50 most statistically significant meta-DEGs (by FDR)
+top50_genes <- final_meta_analysis %>%
+  filter(meta_FDR < 0.05) %>%
+  arrange(meta_FDR) %>%
+  head(50)
+
+# 2. Extract ONLY the logFC columns for these 100 genes to map onto the matrix
+heatmap_matrix <- top50_genes %>%
+  dplyr::select(starts_with("logFC_stud")) %>%
+  as.matrix()
+
+# 3. Assign your biological gene symbols back as the matrix row names
+rownames(heatmap_matrix) <- top50_genes$gene
+
+# 4. Give the columns clean, descriptive publication names instead of "logFC_stud1"
+colnames(heatmap_matrix) <- c(
+  "GSE262523_12w", "GSE313717", "GSE296500",
+  "GSE182668_129S1/SvImJ", "GSE182668_C57BL/6J",
+  "GSE121525", "GSE327003", "GSE335522", "GSE120761"
+)
+# 5. Generate a balanced, publication-grade Blue-White-Red divergent palette
+display_palette <- colorRampPalette(rev(brewer.pal(n = 10, name = "RdBu")))(256)
+
+# 6. Plot the final heatmap
+pheatmap(
+  heatmap_matrix,
+  color = display_palette,
+  cluster_cols = TRUE,         
+  cluster_rows = TRUE,         
+  treeheight_row = 0,
+  treeheight_col = 0,
+  show_rownames = F,        
+  show_colnames = TRUE,        
+  fontsize_row = 14,            
+  fontsize_col = 14,
+  main = "Top 50 Meta-DEGs Cross-Study Expression",
+  border_color = NA           
+)
+
+# --- preserve the male per-study inputs under new names, for covariate analysis ---
+Female_logFC <- meta_input_df[, grep("^logFC_stud", names(meta_input_df))]
+Female_SE    <- meta_input_df[, grep("^SE_stud",    names(meta_input_df))]
+Female_genes <- meta_input_df$gene
+rownames(Female_logFC) <- Female_genes
+rownames(Female_SE)    <- Female_genes
+colnames(Female_logFC) <- study_names   # the 9 female contrast names
+colnames(Female_SE)    <- study_names
+write.csv(Female_logFC, paste0(dfp, "Female_Obs_Log2FC.csv"))
+write.csv(Female_SE, paste0(dfp, "Female_Obs_SE.csv"))
+
+
+
+# GO enrichment
+gene_sig <- significant_meta_DEGs$gene
+gene_back <- final_meta_analysis$gene
+
+gene_entrez <- bitr(
+  gene_sig,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)
+
+background_entrez <- bitr(
+  gene_back,
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)
+
+
+ego_BP <- enrichGO(
+  gene          = gene_entrez$ENTREZID,
+  universe = background_entrez$ENTREZID,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+ego_CC <- enrichGO(
+  gene          = gene_entrez$ENTREZID,
+  universe = background_entrez$ENTREZID,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "CC",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+ego_MF <- enrichGO(
+  gene          = gene_entrez$ENTREZID,
+  universe = background_entrez$ENTREZID,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "MF",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+
+ekegg <- enrichKEGG(
+  gene          = gene_entrez$ENTREZID,
+  universe = background_entrez$ENTREZID,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05
+)
+
+
+# pLOT THE go/kegg
+dotplot(ego_BP, showCategory = 20)
+dotplot(ego_CC, showCategory = 20)
+dotplot(ego_MF, showCategory = 20 , label_format = 30) +
+  theme(axis.text.y = element_text(size = 9))
+dotplot(ekegg, showCategory = 20)
+
+# get the df for the results
+go_BP_results <- as.data.frame(ego_BP)
+go_CC_results <- as.data.frame(ego_CC)
+go_MF_results <- as.data.frame(ego_MF)
+kegg_results <- as.data.frame(ekegg)
+
+# GSEA
+# Use all genes ranked by meta_Z.
+
+gene_rank <- final_meta_analysis$meta_Z
+names(gene_rank) <- final_meta_analysis$gene
+
+gene_rank <- sort(gene_rank, decreasing = TRUE)
+
+# Convert symbols to Entrez IDs:
+
+gene_df <- bitr(
+  names(gene_rank),
+  fromType = "SYMBOL",
+  toType = "ENTREZID",
+  OrgDb = org.Mm.eg.db
+)
+
+gene_rank <- gene_rank[gene_df$SYMBOL]
+names(gene_rank) <- gene_df$ENTREZID
+
+gene_rank <- sort(gene_rank, decreasing = TRUE)
+
+# Run GO GSEA:
+
+gsea_go <- gseGO(
+  geneList      = gene_rank,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "BP",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+gsea_go_CC <- gseGO(
+  geneList      = gene_rank,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "cc",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+gsea_go_MF <- gseGO(
+  geneList      = gene_rank,
+  OrgDb         = org.Mm.eg.db,
+  ont           = "MF",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+# Run KEGG GSEA:
+
+gsea_kegg <- gseKEGG(
+  geneList      = gene_rank,
+  organism      = "mmu",
+  pvalueCutoff  = 0.05,
+  pAdjustMethod = "BH",
+  verbose       = FALSE
+)
+# Plot
+ridgeplot(gsea_go, label_format = 30) +
+  theme(axis.text.y = element_text(size = 10))
+ridgeplot(gsea_go_CC, label_format = 30) +
+  theme(axis.text.y = element_text(size = 10))
+ridgeplot(gsea_go_MF, label_format = 30) +
+  theme(axis.text.y = element_text(size = 10))
+dotplot(gsea_kegg, label_format = 30) +
+  theme(axis.text.y = element_text(size = 12))  # Reduce y-axis pathway font size
+
+# get df for the results
+gsea_BP_results <- as.data.frame(gsea_go)
+gsea_CC_results <- as.data.frame(gsea_go_CC)
+gsea_MF_results <- as.data.frame(gsea_go_MF)
+gsea_kegg_results <- as.data.frame(gsea_kegg)
+
+# ==============================================================================
+# REML secondary analysis
+# ==============================================================================
+# ============================================================
+# RANDOM-EFFECTS META-ANALYSIS
+# REML
+# ============================================================
+
+run_random_effects_REML <- function(logFC, SE) {
+  
+  valid <- is.finite(logFC) &
+    is.finite(SE) &
+    SE > 0
+  
+  logFC <- logFC[valid]
+  SE    <- SE[valid]
+  
+  k <- length(logFC)
+  
+  out <- c(
+    k_REML = k,
+    pooled_logFC = NA,
+    pooled_SE = NA,
+    CI_low = NA,
+    CI_high = NA,
+    REML_P = NA,
+    tau2 = NA,
+    I2_Percent = NA,
+    Cochran_Q = NA,
+    Het_PValue = NA
+  )
+  
+  # Need at least 3 studies for a meta-analysis
+  if (k < 3) {
+    return(out)
+  }
+  
+  fit <- tryCatch(
+    
+    metafor::rma(
+      yi = logFC,
+      sei = SE,
+      method = "REML",
+      level = 95
+    ),
+    
+    error = function(e) NULL
+  )
+  
+  if (is.null(fit)) {
+    return(out)
+  }
+  
+  out["pooled_logFC"] <- as.numeric(
+    fit$b[1]
+  )
+  
+  out["pooled_SE"] <- fit$se
+  
+  out["CI_low"] <- fit$ci.lb
+  
+  out["CI_high"] <- fit$ci.ub
+  
+  out["REML_P"] <- fit$pval
+  
+  out["tau2"] <- fit$tau2
+  
+  out["I2_Percent"] <- fit$I2
+  
+  out["Cochran_Q"] <- fit$QE
+  
+  out["Het_PValue"] <- fit$QEp
+  
+  return(out)
+}
+
+# Run REML accross genes
+lfc_mat <- as.matrix(
+  final_meta_analysis[, logFC_cols]
+)
+
+se_cols <- paste0(
+  "SE_stud",
+  seq_along(study_objects)
+)
+
+se_mat <- as.matrix(
+  final_meta_analysis[, se_cols]
+)
+
+random_meta_stats <- t(
+  vapply(
+    seq_len(nrow(final_meta_analysis)),
+    
+    function(i) {
+      
+      run_random_effects_REML(
+        logFC = lfc_mat[i, ],
+        SE = se_mat[i, ]
+      )
+      
+    },
+    
+    FUN.VALUE = numeric(10)
+  )
+)
+
+random_meta_stats <- as.data.frame(
+  random_meta_stats
+)
+
+random_meta_stats$gene <-
+  final_meta_analysis$gene
+
+final_meta_analysis <- final_meta_analysis %>%
+  left_join(
+    random_meta_stats,
+    by = "gene"
+  )
+
+
+
+# Characterize heterogeneity
+final_meta_analysis <- final_meta_analysis %>%
+  mutate(
+    Heterogeneity_Category = case_when(
+      I2_Percent < 25 ~ "Low",
+      I2_Percent < 50 ~ "Moderate",
+      I2_Percent < 75 ~ "Substantial",
+      TRUE ~ "High"
+    )
+  )
+highly_reproducible_DEGs <- final_meta_analysis %>%
+  filter(
+    meta_FDR < 0.05,
+    I2_Percent < 25
+  )
+heterogeneous_DEGs <- final_meta_analysis %>%
+  filter(
+    meta_FDR < 0.05,
+    I2_Percent >= 50
+  )
+# ==============================================================================
+# AUTOMATIC EXPORT TO EXCEL (SUPPLEMENTARY TABLE S1)
+# ==============================================================================
+wb <- createWorkbook()
+addWorksheet(wb, "highly_reproducible_DEGs")
+addWorksheet(wb, "heterogeneous_DEGs")
+addWorksheet(wb, "significant_meta_DEGs")
+addWorksheet(wb, "All_Meta_Analysis_Results")
+# GO/KEGG enrichment
+addWorksheet(wb, "GO_BP")
+addWorksheet(wb, "GO_CC")
+addWorksheet(wb, "GO_MF")
+addWorksheet(wb, "KEGG")
+# GSEA
+addWorksheet(wb, "GSEA_GO_BP")
+addWorksheet(wb, "GSEA_GO_CC")
+addWorksheet(wb, "GSEA_GO_MF")
+addWorksheet(wb, "GSEA_KEGG")
+
+# Write the clean filtered core signature to the first tab
+writeData(wb, "highly_reproducible_DEGs", highly_reproducible_DEGs, rowNames = FALSE)
+# Write the clean filtered core signature to the first tab
+writeData(wb, "heterogeneous_DEGs", heterogeneous_DEGs, rowNames = FALSE)
+# Write the clean filtered core signature to the second tab
+writeData(wb, "significant_meta_DEGs", significant_meta_DEGs, rowNames = FALSE)
+# Write the full dataset to the third tab for completeness
+writeData(wb, "All_Meta_Analysis_Results", final_meta_analysis, rowNames = FALSE)
+# writedata for enrichment
+writeData(wb, "GO_BP",  go_BP_results)
+writeData(wb, "GO_CC",  go_CC_results)
+writeData(wb, "GO_MF",  go_MF_results)
+writeData(wb, "KEGG",  kegg_results)
+# writedata for GSEA enrichment
+writeData(wb, "GSEA_GO_BP",  gsea_BP_results)
+writeData(wb, "GSEA_GO_CC",    gsea_CC_results)
+writeData(wb, "GSEA_GO_MF",  gsea_MF_results)
+writeData(wb, "GSEA_KEGG",  gsea_kegg_results)
+# Save the workbook to your directory
+output_file <- file.path(dfp, "Obesity_Females_Highly_Reproducible_Meta_DEGs.xlsx")
+saveWorkbook(wb, output_file, overwrite = TRUE)
+
+cat(paste0("\nFile successfully exported to: ", output_file, "\n"))
+
+
+
+# ============================================================
+# FOREST PLOTS FOR TOP 10 GENES 
+# Study names
+study_labels <- c(
+  "GSE262523_12w",
+  "GSE313717",
+  "GSE296500",
+  "GSE182668_129S1/SvImJ",
+  "GSE182668_C57BL/6J",
+  "GSE121525",
+  "GSE327003",
+  "GSE335522",
+  "GSE120761"
+)
+
+top_genes <- significant_meta_DEGs %>%
+  arrange(meta_FDR) %>%
+  slice_head(n = 10) %>%
+  pull(gene)
+
+top_genes
+
+for (gene_to_plot in top_genes) {
+  
+  gene_row <- final_meta_analysis %>%
+    filter(gene == gene_to_plot)
+  
+  yi <- as.numeric(gene_row[1, paste0("logFC_stud", 1:9)])
+  sei <- as.numeric(gene_row[1, paste0("SE_stud",    1:9)])
+  
+  keep <- is.finite(yi) & is.finite(sei) &  sei > 0
+  
+  yi <- yi[keep]
+  sei <- sei[keep]
+  
+  study_labels_plot <- study_labels[keep]
+  
+  # Need at least 2 studies
+  if (length(yi) < 2) {
+    next
+  }
+  
+  # REML model
+  fit <- rma(
+    yi = yi,
+    sei = sei,
+    method = "REML"
+  )
+  
+  # Forest plot
+  forest(
+    fit,
+    slab = study_labels_plot,
+    xlab = "Log2 Fold Change",
+    mlab = "REML Random-Effects Pooled Estimate",
+    header = "Study",
+    cex = 0.75,
+    pch = 15
+  )
+  
+  title(
+    main = paste0(
+      gene_to_plot,
+      " — REML Random-Effects Meta-Analysis"
+    )
+  )
+}
+
+# Cross-study log2FC correlation + clustered heatmap : Obesity tier
+# ============================================================================
+
+
+# Rebuild lfc_mat fresh and label it (do not reuse a keep-subset version)
+lfc_mat <- as.matrix(final_meta_analysis[, paste0("logFC_stud", 1:9)])
+colnames(lfc_mat) <- study_labels
+stopifnot(ncol(lfc_mat) == length(study_labels))
+
+# ---- 1. Correlation matrix (Spearman, pairwise-complete) ------------------
+cor_mat <- cor(lfc_mat, use = "pairwise.complete.obs", method = "spearman")
+write.csv(round(cor_mat, 3), paste0(dfp, "Obesity_Females_Log2FC_CorMatrix.csv"))
+print(round(cor_mat, 2))
+
+# How many genes underlie each pairwise correlation (watch for thin overlap)
+n_shared <- crossprod(!is.na(lfc_mat))
+cat("\nMin shared genes in any study pair: ", min(n_shared[upper.tri(n_shared)]), "\n", sep = "")
+
+# QC read
+cm <- cor_mat; diag(cm) <- NA
+cat("\nMean correlation with other studies (low/neg = divergent):\n")
+print(round(rowMeans(cm, na.rm = TRUE), 2))
+cat("Highest off-diagonal (possible non-independence):",
+    round(max(cm, na.rm = TRUE), 2), "\n")
+
+
+
+# ---- 2. Clustered heatmap -------------------------------------------------
+
+pheatmap(cor_mat,
+         color  = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100),
+         breaks = seq(-1, 1, length.out = 101),
+         display_numbers = TRUE, 
+         number_format = "%.2f", 
+         fontsize_number = 14,
+         fontsize_row = 14,            
+         fontsize_col = 14,
+         number_color = "black",
+         clustering_method = "complete",
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         treeheight_row = 0, 
+         treeheight_col = 0,
+         main = "Cross-study log2FC correlation (Spearman): Obesity in Females")
