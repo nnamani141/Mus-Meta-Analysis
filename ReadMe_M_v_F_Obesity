@@ -1,0 +1,20 @@
+# Male vs. Female Obesity Meta-Analysis (`Male-v_Female_Obesity`)
+
+This folder contains the R script and analytical pipeline for performing sex-stratified and comparative meta-regression on mouse hepatic obesity datasets.
+
+## Pipeline Overview
+
+1. **Study Integration & Pairing:** Maps matched male and female study arms from identical GEO series (e.g., GSE262523, GSE313717, GSE296500, GSE182668) using a shared study lookup vector.
+2. **Meta-Regression Modeling:** Fits multivariate mixed-effects models (`rma.mv` from `metafor`) with sex as a covariate (`mods = ~sex`) and study as a random effect (`random = ~1 | study`) using REML estimation.
+3. **Classification & Signatures:** 
+   - **Sex-Adjusted Obesity Signature:** Identifies overall diet-responsive genes using the meta-regression intercept.
+   - **Sex-by-Obesity Interaction:** Evaluates sexual dimorphism using the sex coefficient (`+ = male-biased`).
+   - Categorizes genes into **Concordant** vs. **Sex-Dimorphic** subsets based on Benjamini-Hochberg adjusted FDR thresholds.
+4. **Visualizations:** Generates EnhancedVolcano plots for sex-adjusted and interaction effects, cross-sex concordance scatter plots (Spearman correlation), and per-gene forest plots for top dimorphic targets.
+5. **Excel Export:** Automatically compiles and exports multi-tab spreadsheets containing the categorized DEGs (`Concordant_MF_Meta_DEGs.xlsx`).
+
+## Execution Note
+> **Critical Requirement:** Do not clear the global environment between running the independent male and female obesity pipelines. Both `Male_*` and `Female_*` objects must coexist in the workspace before executing this comparative script.
+
+## Dependencies
+- `metafor`, `dplyr`, `ggplot2`, `ggrepel`, `EnhancedVolcano`, `openxlsx`
